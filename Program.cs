@@ -5,157 +5,193 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.WebUtilities;
 
-var builder = WebApplication.CreateBuilder(args);
+namespace EReceiptOnlineDemo;
 
-var demoMode = builder.Configuration.GetValue<bool>("Demo", true);
-var opts = builder.Configuration.GetSection("Shortener").Get<ShortenerOptions>() ?? new ShortenerOptions();
-
-var app = builder.Build();
-
-var receipts = new ConcurrentDictionary<string, Receipt>();
-var tokenToReceipt = new ConcurrentDictionary<string, string>();
-var codes = new ConcurrentDictionary<string, ShortMap>();
-var otpStore = new ConcurrentDictionary<string, OtpEntry>();
-
-app.MapGet("/", () => Results.Content(IndexHtml, "text/html"));
-
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-
-app.MapPost("/tcrm/issue", async (IssueRequest req) =>
+public class Program
 {
-    if (req == null || string.IsNullOrWhiteSpace(req.TxnId) || string.IsNullOrWhiteSpace(req.Msisdn))
-        return Results.BadRequest(new { error = "Missing fields" });
-
-    var token = WebEncoders.Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
-    var longUrl = $"{opts.ViewBaseUrl}?token={token}";
-
-    var code = GenerateCode(opts.CodeLength <= 0 ? 7 : opts.CodeLength);
-    var expiresAt = DateTimeOffset.UtcNow.AddHours(opts.DefaultTtlHours <= 0 ? 48 : opts.DefaultTtlHours);
-
-    var receipt = new Receipt
+    public static void Main(string[] args)
     {
-        ReceiptId = Guid.NewGuid().ToString("N"),
-        TxnId = req.TxnId,
-        Msisdn = req.Msisdn,
-        Amount = req.Amount,
-        Currency = string.IsNullOrWhiteSpace(req.Currency) ? "USD" : req.Currency,
-        Items = req.Items ?? new List<ReceiptItem>(),
-        ExpiresAt = expiresAt,
-        MaxUses = opts.DefaultUsageMax <= 0 ? 2 : opts.DefaultUsageMax,
-        Uses = 0,
-        CreatedAt = DateTimeOffset.UtcNow
-    };
-    receipts[receipt.ReceiptId] = receipt;
-    tokenToReceipt[token] = receipt.ReceiptId;
+        var builder = WebApplication.CreateBuilder(args);
 
-    codes[code] = new ShortMap
-    {
-        Code = code,
-        Token = token,
-        LongUrl = longUrl,
-        ExpiresAt = expiresAt,
-        Usage = 0,
-        UsageMax = receipt.MaxUses,
-        CreatedAt = DateTimeOffset.UtcNow
-    };
+        var demoMode = builder.Configuration.GetValue<bool>("Demo", true);
+        var opts = builder.Configuration.GetSection("Shortener").Get<ShortenerOptions>() ?? new ShortenerOptions();
 
-    var shortUrl = $"{opts.ShortBaseUrl.TrimEnd('/')}/s/{code}";
-    Console.WriteLine($"[DEMO SMS] to {req.Msisdn}: {shortUrl}");
+        var app = builder.Build();
 
-    return Results.Ok(new
-    {
-        receiptId = receipt.ReceiptId,
-        token,
-        longUrl,
-        shortUrl,
-        expiresAt
-    });
-});
+        var receipts = new ConcurrentDictionary<string, Receipt>();
+        var tokenToReceipt = new ConcurrentDictionary<string, string>();
+        var codes = new ConcurrentDictionary<string, ShortMap>();
+        var otpStore = new ConcurrentDictionary<string, OtpEntry>();
 
-app.MapGet("/s/{code}", (string code) =>
-{
-    if (!codes.TryGetValue(code, out var map))
-        return Results.Content(ErrorPage("Invalid or unknown link code."), "text/html", Encoding.UTF8);
-    if (map.ExpiresAt <= DateTimeOffset.UtcNow)
-        return Results.Content(ErrorPage("This link has expired."), "text/html", Encoding.UTF8);
-    if (map.Usage >= map.UsageMax)
-        return Results.Content(ErrorPage("Maximum number of allowed views has been reached."), "text/html", Encoding.UTF8);
-    return Results.Redirect(map.LongUrl, false);
-});
+        app.MapGet("/", () => Results.Content(Templates.IndexHtml, "text/html"));
 
-app.MapGet("/view", (HttpRequest http) =>
-{
-    var token = http.Query["token"].ToString();
-    if (string.IsNullOrWhiteSpace(token)) return Results.Content(ErrorPage("Missing token"), "text/html");
-    if (!tokenToReceipt.TryGetValue(token, out var rid) || !receipts.TryGetValue(rid, out var rec))
-        return Results.Content(ErrorPage("Invalid or unknown token"), "text/html");
-    if (rec.ExpiresAt <= DateTimeOffset.UtcNow)
-        return Results.Content(ErrorPage("This link has expired."), "text/html");
-    if (rec.Uses >= rec.MaxUses)
-        return Results.Content(ErrorPage("Maximum number of allowed views has been reached."), "text/html");
-    return Results.Content(ViewHtml(token, rec), "text/html");
-});
+        app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
-app.MapPost("/api/otp/send", (OtpSendRequest req) =>
-{
-    if (req == null || string.IsNullOrWhiteSpace(req.Token))
-        return Results.BadRequest(new { error = "Missing token" });
-    if (!tokenToReceipt.TryGetValue(req.Token, out var rid) || !receipts.TryGetValue(rid, out var rec))
-        return Results.BadRequest(new { error = "Invalid token" });
+        // ---- ISSUE from "TCRM" page (demo) ----
+        app.MapPost("/tcrm/issue", (IssueRequest req) =>
+        {
+            if (req == null || string.IsNullOrWhiteSpace(req.TxnId) || string.IsNullOrWhiteSpace(req.Msisdn))
+                return Results.BadRequest(new { error = "Missing fields" });
 
-    var code = new Random().Next(100000, 999999).ToString();
-    otpStore[req.Token] = new OtpEntry { Code = code, ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5), AttemptsLeft = 3 };
-    Console.WriteLine($"[DEMO OTP] to {rec.Msisdn}: {code}");
-    return Results.Ok(new { otpDemo = demoMode ? code : "SENT" });
-});
+            // mint token (256-bit, base64url)
+            var token = WebEncoders.Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
+            var longUrl = $"{opts.ViewBaseUrl}?token={token}";
 
-app.MapPost("/api/otp/verify", (OtpVerifyRequest req) =>
-{
-    if (req == null || string.IsNullOrWhiteSpace(req.Token) || string.IsNullOrWhiteSpace(req.Code))
-        return Results.BadRequest(new { error = "Missing fields" });
-    if (!otpStore.TryGetValue(req.Token, out var entry))
-        return Results.BadRequest(new { error = "OTP not issued" });
-    if (entry.ExpiresAt <= DateTimeOffset.UtcNow)
-        return Results.BadRequest(new { error = "OTP expired" });
-    if (entry.AttemptsLeft <= 0)
-        return Results.BadRequest(new { error = "Too many attempts" });
-    if (!string.Equals(entry.Code, req.Code))
-    {
-        entry.AttemptsLeft -= 1;
-        return Results.BadRequest(new { error = "Invalid code", attemptsLeft = entry.AttemptsLeft });
+            var code = Helpers.GenerateCode(opts.CodeLength <= 0 ? 7 : opts.CodeLength);
+            var expiresAt = DateTimeOffset.UtcNow.AddHours(opts.DefaultTtlHours <= 0 ? 48 : opts.DefaultTtlHours);
+
+            var receipt = new Receipt
+            {
+                ReceiptId = Guid.NewGuid().ToString("N"),
+                TxnId = req.TxnId,
+                Msisdn = req.Msisdn,
+                Amount = req.Amount,
+                Currency = string.IsNullOrWhiteSpace(req.Currency) ? "USD" : req.Currency,
+                Items = req.Items ?? new List<ReceiptItem>(),
+                ExpiresAt = expiresAt,
+                MaxUses = opts.DefaultUsageMax <= 0 ? 2 : opts.DefaultUsageMax,
+                Uses = 0,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+            receipts[receipt.ReceiptId] = receipt;
+            tokenToReceipt[token] = receipt.ReceiptId;
+
+            codes[code] = new ShortMap
+            {
+                Code = code,
+                Token = token,
+                LongUrl = longUrl,
+                ExpiresAt = expiresAt,
+                Usage = 0,
+                UsageMax = receipt.MaxUses,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+
+            var shortUrl = $"{opts.ShortBaseUrl.TrimEnd('/')}/s/{code}";
+            Console.WriteLine($"[DEMO SMS] to {req.Msisdn}: {shortUrl}");
+
+            return Results.Ok(new
+            {
+                receiptId = receipt.ReceiptId,
+                token,
+                longUrl,
+                shortUrl,
+                expiresAt
+            });
+        });
+
+        // ---- PUBLIC facade: short link ----
+        app.MapGet("/s/{code}", (string code) =>
+        {
+            if (!codes.TryGetValue(code, out var map))
+                return Results.Content(Templates.ErrorPage("Invalid or unknown link code."), "text/html", Encoding.UTF8);
+
+            if (map.ExpiresAt <= DateTimeOffset.UtcNow)
+                return Results.Content(Templates.ErrorPage("This link has expired."), "text/html", Encoding.UTF8);
+
+            if (map.Usage >= map.UsageMax)
+                return Results.Content(Templates.ErrorPage("Maximum number of allowed views has been reached."), "text/html", Encoding.UTF8);
+
+            return Results.Redirect(map.LongUrl, false);
+        });
+
+        // ---- PUBLIC facade: view page ----
+        app.MapGet("/view", (HttpRequest http) =>
+        {
+            var token = http.Query["token"].ToString();
+            if (string.IsNullOrWhiteSpace(token)) return Results.Content(Templates.ErrorPage("Missing token"), "text/html");
+
+            if (!tokenToReceipt.TryGetValue(token, out var rid) || !receipts.TryGetValue(rid, out var rec))
+                return Results.Content(Templates.ErrorPage("Invalid or unknown token"), "text/html");
+
+            if (rec.ExpiresAt <= DateTimeOffset.UtcNow)
+                return Results.Content(Templates.ErrorPage("This link has expired."), "text/html");
+
+            if (rec.Uses >= rec.MaxUses)
+                return Results.Content(Templates.ErrorPage("Maximum number of allowed views has been reached."), "text/html");
+
+            // pre-OTP page
+            return Results.Content(Templates.ViewHtml(token, rec), "text/html");
+        });
+
+        // ---- API: send OTP (demo: return code in JSON + log) ----
+        app.MapPost("/api/otp/send", (OtpSendRequest req) =>
+        {
+            if (req == null || string.IsNullOrWhiteSpace(req.Token))
+                return Results.BadRequest(new { error = "Missing token" });
+
+            if (!tokenToReceipt.TryGetValue(req.Token, out var rid) || !receipts.TryGetValue(rid, out var rec))
+                return Results.BadRequest(new { error = "Invalid token" });
+
+            var code = new Random().Next(100000, 999999).ToString();
+            var entry = new OtpEntry
+            {
+                Code = code,
+                ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+                AttemptsLeft = 3
+            };
+            otpStore[req.Token] = entry;
+
+            Console.WriteLine($"[DEMO OTP] to {rec.Msisdn}: {code}");
+
+            return Results.Ok(new { otpDemo = demoMode ? code : "SENT" });
+        });
+
+        // ---- API: verify OTP ----
+        app.MapPost("/api/otp/verify", (OtpVerifyRequest req) =>
+        {
+            if (req == null || string.IsNullOrWhiteSpace(req.Token) || string.IsNullOrWhiteSpace(req.Code))
+                return Results.BadRequest(new { error = "Missing fields" });
+
+            if (!otpStore.TryGetValue(req.Token, out var entry))
+                return Results.BadRequest(new { error = "OTP not issued" });
+
+            if (entry.ExpiresAt <= DateTimeOffset.UtcNow)
+                return Results.BadRequest(new { error = "OTP expired" });
+
+            if (entry.AttemptsLeft <= 0)
+                return Results.BadRequest(new { error = "Too many attempts" });
+
+            if (!string.Equals(entry.Code, req.Code))
+            {
+                entry.AttemptsLeft -= 1;
+                return Results.BadRequest(new { error = "Invalid code", attemptsLeft = entry.AttemptsLeft });
+            }
+
+            // success
+            if (!tokenToReceipt.TryGetValue(req.Token, out var rid) || !receipts.TryGetValue(rid, out var rec))
+                return Results.BadRequest(new { error = "Invalid token" });
+
+            // increment usage (simulate atomically)
+            if (rec.ExpiresAt <= DateTimeOffset.UtcNow)
+                return Results.BadRequest(new { error = "Link expired" });
+            if (rec.Uses >= rec.MaxUses)
+                return Results.BadRequest(new { error = "Usage limit exceeded" });
+
+            rec.Uses += 1;
+            otpStore.TryRemove(req.Token, out _);
+
+            return Results.Ok(new { receiptId = rec.ReceiptId });
+        });
+
+        // ---- API: receipt JSON ----
+        app.MapGet("/api/receipt/{id}", (string id) =>
+        {
+            if (!receipts.TryGetValue(id, out var rec))
+                return Results.NotFound(new { error = "Not found" });
+            return Results.Ok(rec);
+        });
+
+        // ---- static assets ----
+        app.MapGet("/style.css", () => Results.Content(Templates.Css, "text/css"));
+        app.MapGet("/script.js", () => Results.Content(Templates.ScriptJs, "application/javascript"));
+
+        app.Run("http://0.0.0.0:8080");
     }
-    if (!tokenToReceipt.TryGetValue(req.Token, out var rid) || !receipts.TryGetValue(rid, out var rec))
-        return Results.BadRequest(new { error = "Invalid token" });
-    if (rec.ExpiresAt <= DateTimeOffset.UtcNow)
-        return Results.BadRequest(new { error = "Link expired" });
-    if (rec.Uses >= rec.MaxUses)
-        return Results.BadRequest(new { error = "Usage limit exceeded" });
-    rec.Uses += 1;
-    otpStore.TryRemove(req.Token, out _);
-    return Results.Ok(new { receiptId = rec.ReceiptId });
-});
-
-app.MapGet("/api/receipt/{id}", (string id) =>
-{
-    if (!receipts.TryGetValue(id, out var rec)) return Results.NotFound(new { error = "Not found" });
-    return Results.Ok(rec);
-});
-
-app.MapGet("/style.css", () => Results.Content(Css, "text/css"));
-app.MapGet("/script.js", () => Results.Content(ScriptJs, "application/javascript"));
-
-app.Run("http://0.0.0.0:8080");
-
-static string GenerateCode(int length)
-{
-    const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    var bytes = RandomNumberGenerator.GetBytes(length);
-    Span<char> chars = stackalloc char[length];
-    for (int i = 0; i < length; i++) chars[i] = alphabet[bytes[i] % alphabet.Length];
-    return new string(chars);
 }
 
-record ShortenerOptions
+// ========= Models =========
+public record ShortenerOptions
 {
     public string ShortBaseUrl { get; set; } = "http://localhost:8080";
     public string ViewBaseUrl { get; set; } = "http://localhost:8080/view";
@@ -164,7 +200,7 @@ record ShortenerOptions
     public int DefaultUsageMax { get; set; } = 2;
 }
 
-record IssueRequest
+public record IssueRequest
 {
     public string TxnId { get; init; } = default!;
     public string Msisdn { get; init; } = default!;
@@ -172,8 +208,16 @@ record IssueRequest
     public string Currency { get; init; } = "USD";
     public List<ReceiptItem>? Items { get; init; }
 }
-record ReceiptItem { public string Sku { get; init; } = ""; public string Name { get; init; } = ""; public int Qty { get; init; } public decimal Price { get; init; } }
-record Receipt
+
+public record ReceiptItem
+{
+    public string Sku { get; init; } = "";
+    public string Name { get; init; } = "";
+    public int Qty { get; init; }
+    public decimal Price { get; init; }
+}
+
+public record Receipt
 {
     public string ReceiptId { get; init; } = default!;
     public string TxnId { get; init; } = default!;
@@ -186,7 +230,8 @@ record Receipt
     public int Uses { get; set; } = 0;
     public DateTimeOffset CreatedAt { get; init; }
 }
-record ShortMap
+
+public record ShortMap
 {
     public string Code { get; init; } = default!;
     public string Token { get; init; } = default!;
@@ -196,11 +241,33 @@ record ShortMap
     public DateTimeOffset ExpiresAt { get; init; }
     public DateTimeOffset CreatedAt { get; init; }
 }
-record OtpEntry { public string Code { get; init; } = default!; public DateTimeOffset ExpiresAt { get; init; } public int AttemptsLeft { get; set; } = 3; }
-record OtpSendRequest { public string Token { get; init; } = default!; }
-record OtpVerifyRequest { public string Token { get; init; } = default!; public string Code { get; init; } = default!; }
 
-const string IndexHtml = """
+public record OtpEntry
+{
+    public string Code { get; init; } = default!;
+    public DateTimeOffset ExpiresAt { get; init; }
+    public int AttemptsLeft { get; set; } = 3;
+}
+
+public record OtpSendRequest { public string Token { get; init; } = default!; }
+public record OtpVerifyRequest { public string Token { get; init; } = default!; public string Code { get; init; } = default!; }
+
+// ========= Helpers & Templates =========
+public static class Helpers
+{
+    public static string GenerateCode(int length)
+    {
+        const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        var bytes = RandomNumberGenerator.GetBytes(length);
+        Span<char> chars = stackalloc char[length];
+        for (int i = 0; i < length; i++) chars[i] = alphabet[bytes[i] % alphabet.Length];
+        return new string(chars);
+    }
+}
+
+public static class Templates
+{
+    public static string IndexHtml => """
 <!doctype html>
 <html>
 <head>
@@ -223,6 +290,7 @@ const string IndexHtml = """
       <button id='btnIssue'>Generate e-Receipt</button>
       <div id='issueResult'></div>
     </section>
+
     <section class='card'>
       <h2>Customer SMS Preview (demo)</h2>
       <div id='smsPreview'>—</div>
@@ -233,7 +301,11 @@ const string IndexHtml = """
 </html>
 """;
 
-static string ViewHtml(string token, Receipt r) => $@"
+    public static string ViewHtml(string token, Receipt r)
+    {
+        var last4 = System.Net.WebUtility.HtmlEncode(r.Msisdn.Length >= 4 ? r.Msisdn[^4..] : r.Msisdn);
+        var tokenJson = JsonSerializer.Serialize(token);
+        return $@"
 <!doctype html>
 <html>
 <head>
@@ -247,7 +319,7 @@ static string ViewHtml(string token, Receipt r) => $@"
   <main>
     <section class='card'>
       <h2>Verify Access</h2>
-      <p>For security, we sent a one-time code to your phone ending with <strong>{System.Net.WebUtility.HtmlEncode(r.Msisdn[^4..])}</strong>.</p>
+      <p>For security, we sent a one-time code to your phone ending with <strong>{last4}</strong>.</p>
       <button id='sendOtp'>Send OTP</button>
       <div id='otpDemo'></div>
       <div class='grid'>
@@ -258,30 +330,31 @@ static string ViewHtml(string token, Receipt r) => $@"
     </section>
   </main>
 <script>
-const token = {JsonSerializer.Serialize(token)};
-document.getElementById('sendOtp').onclick = async () => {
-  const res = await fetch('/api/otp/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token }) });
+const token = {tokenJson};
+document.getElementById('sendOtp').onclick = async () => {{
+  const res = await fetch('/api/otp/send', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{ token }}) }});
   const json = await res.json();
   document.getElementById('otpDemo').innerHTML = json.otpDemo ? '<small>DEMO OTP: <b>'+json.otpDemo+'</b></small>' : '';
-};
-document.getElementById('verifyOtp').onclick = async () => {
+}};
+document.getElementById('verifyOtp').onclick = async () => {{
   const code = document.getElementById('otpCode').value;
-  const res = await fetch('/api/otp/verify', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token, code }) });
+  const res = await fetch('/api/otp/verify', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{ token, code }}) }});
   const json = await res.json();
   const status = document.getElementById('status');
-  if(res.ok) {
+  if(res.ok) {{
     status.innerHTML = '✅ Verified. Opening receipt...';
     window.location.href = '/receipt.html#'+json.receiptId;
-  } else {
+  }} else {{
     status.innerHTML = '❌ '+(json.error || 'Failed');
-  }
-};
+  }}
+}};
 </script>
 </body>
 </html>
 ";
+    }
 
-const string Css = """
+    public static string Css => """
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,Helvetica,sans-serif;background:#f6f8fb;margin:0;color:#111}
 header{background:#0f172a;color:#fff;padding:14px 20px}
 main{max-width:920px;margin:24px auto;padding:0 16px}
@@ -296,8 +369,9 @@ button:hover{background:#1d4ed8}
 small{color:#6b7280}
 """;
 
-const string ScriptJs = """
+    public static string ScriptJs => """
 const el = (id)=>document.getElementById(id);
+
 if (document.getElementById('btnIssue')){
   el('btnIssue').onclick = async ()=>{
     const payload = {
@@ -317,6 +391,7 @@ if (document.getElementById('btnIssue')){
     }
   };
 }
+
 // Receipt viewer
 if (location.pathname.endsWith('/receipt.html')){
   const rid = location.hash.substring(1);
@@ -341,4 +416,6 @@ if (location.pathname.endsWith('/receipt.html')){
   })();
 }
 """;
+}
 
+// Receipt static shell
