@@ -1,6 +1,7 @@
-// Program.cs  (no top-level statements)
+// Program.cs (class-based; safe for .NET 8, no top-level statements)
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
+using System.Text;
 using System.IO;
 using Microsoft.AspNetCore.WebUtilities;
 
@@ -14,10 +15,11 @@ public class Program
 
         var demoMode = builder.Configuration.GetValue<bool>("Demo", true);
         var opts = builder.Configuration.GetSection("Shortener").Get<ShortenerOptions>() ?? new ShortenerOptions();
+        var hmac = builder.Configuration.GetSection("Hmac").Get<HmacOptions>() ?? new HmacOptions();
 
         var app = builder.Build();
 
-        // Static files from wwwroot (index.html, view.html, receipt.html, style.css, script.js)
+        // Static files (wwwroot/index.html, view.html, receipt.html, style.css, script.js)
         app.UseDefaultFiles();
         app.UseStaticFiles();
 
@@ -35,7 +37,7 @@ public class Program
 """, "text/html");
         });
 
-        // SPA-style fallback to index.html for unknown paths
+        // Fallback to index.html for unknown paths
         app.MapFallback((IWebHostEnvironment env) =>
         {
             var indexPath = Path.Combine(env.WebRootPath ?? "", "index.html");
@@ -47,21 +49,34 @@ public class Program
         app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
         // In-memory stores
-        var receipts      = new ConcurrentDictionary<string, Receipt>();
-        var tokenToReceipt= new ConcurrentDictionary<string, string>();
-        var codes         = new ConcurrentDictionary<string, ShortMap>();
-        var otpStore      = new ConcurrentDictionary<string, OtpEntry>();
+        var receipts       = new ConcurrentDictionary<string, Receipt>();
+        var tokenToReceipt = new ConcurrentDictionary<string, string>();
+        var codes          = new ConcurrentDictionary<string, ShortMap>();
+        var otpStore       = new ConcurrentDictionary<string, OtpEntry>();
 
-        // Issue receipt (Agent action)
+        // ---- Issue receipt (Agent action) ----
         app.MapPost("/tcrm/issue", (IssueRequest req) =>
         {
             if (req is null || string.IsNullOrWhiteSpace(req.TxnId) || string.IsNullOrWhiteSpace(req.Msisdn))
                 return Results.BadRequest(new { error = "Missing fields" });
 
-            var token   = WebEncoders.Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
-            var longUrl = $"{opts.ViewBaseUrl}?token={token}";
+            // Random token + timestamp
+            var token = WebEncoders.Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
+            var ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-            var code      = GenerateCode(opts.CodeLength <= 0 ? 7 : opts.CodeLength);
+            // HMAC signature of token.ts (base64url)
+            string sig = "";
+            if (hmac.Enabled)
+            {
+                sig = ComputeHmac(token, ts, hmac.Secret);
+            }
+
+            // Long URL carries token + ts + sig when HMAC is enabled
+            var longUrl = hmac.Enabled
+                ? $"{opts.ViewBaseUrl}?token={token}&ts={ts}&sig={sig}"
+                : $"{opts.ViewBaseUrl}?token={token}";
+
+            var code = GenerateCode(opts.CodeLength <= 0 ? 7 : opts.CodeLength);
             var expiresAt = DateTimeOffset.UtcNow.AddHours(opts.DefaultTtlHours <= 0 ? 48 : opts.DefaultTtlHours);
 
             var receipt = new Receipt
@@ -98,13 +113,15 @@ public class Program
             {
                 receiptId = receipt.ReceiptId,
                 token,
+                ts,
+                sig,
                 longUrl,
                 shortUrl,
                 expiresAt
             });
         });
 
-        // Short link redirect
+        // ---- Short link redirect ----
         app.MapGet("/s/{code}", (string code) =>
         {
             if (!codes.TryGetValue(code, out var map))
@@ -116,11 +133,20 @@ public class Program
             return Results.Redirect(map.LongUrl, false);
         });
 
-        // OTP APIs (demo)
+        // ---- OTP send (validate HMAC first if enabled) ----
         app.MapPost("/api/otp/send", (OtpSendRequest req) =>
         {
             if (req == null || string.IsNullOrWhiteSpace(req.Token))
                 return Results.BadRequest(new { error = "Missing token" });
+
+            if (hmac.Enabled)
+            {
+                if (req.Ts is null || string.IsNullOrWhiteSpace(req.Sig))
+                    return Results.BadRequest(new { error = "Missing HMAC parameters" });
+                if (!ValidateHmac(req.Token, req.Ts.Value, req.Sig!, hmac.Secret, hmac.SkewSeconds))
+                    return Results.BadRequest(new { error = "Invalid HMAC" });
+            }
+
             if (!tokenToReceipt.TryGetValue(req.Token, out var rid) || !receipts.TryGetValue(rid, out var rec))
                 return Results.BadRequest(new { error = "Invalid token" });
 
@@ -131,10 +157,20 @@ public class Program
             return Results.Ok(new { otpDemo = demoMode ? code : "SENT" });
         });
 
+        // ---- OTP verify (validate HMAC first if enabled) ----
         app.MapPost("/api/otp/verify", (OtpVerifyRequest req) =>
         {
             if (req == null || string.IsNullOrWhiteSpace(req.Token) || string.IsNullOrWhiteSpace(req.Code))
                 return Results.BadRequest(new { error = "Missing fields" });
+
+            if (hmac.Enabled)
+            {
+                if (req.Ts is null || string.IsNullOrWhiteSpace(req.Sig))
+                    return Results.BadRequest(new { error = "Missing HMAC parameters" });
+                if (!ValidateHmac(req.Token, req.Ts.Value, req.Sig!, hmac.Secret, hmac.SkewSeconds))
+                    return Results.BadRequest(new { error = "Invalid HMAC" });
+            }
+
             if (!otpStore.TryGetValue(req.Token, out var entry))
                 return Results.BadRequest(new { error = "OTP not issued" });
             if (entry.ExpiresAt <= DateTimeOffset.UtcNow)
@@ -160,19 +196,19 @@ public class Program
             return Results.Ok(new { receiptId = rec.ReceiptId });
         });
 
-        // Receipt JSON
+        // ---- Receipt JSON ----
         app.MapGet("/api/receipt/{id}", (string id) =>
         {
             if (!receipts.TryGetValue(id, out var rec)) return Results.NotFound(new { error = "Not found" });
             return Results.Ok(rec);
         });
 
-        // Bind to Render PORT (no hard-coded 8080)
+        // Bind to platform port
         var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
         app.Run($"http://0.0.0.0:{port}");
     }
 
-    // Helper in Program class
+    // ===== helpers (inside Program class) =====
     static string GenerateCode(int length)
     {
         const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -181,9 +217,32 @@ public class Program
         for (int i = 0; i < length; i++) chars[i] = alphabet[bytes[i] % alphabet.Length];
         return new string(chars);
     }
+
+    static string ComputeHmac(string token, long ts, string secret)
+    {
+        using var h = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+        var data = Encoding.UTF8.GetBytes($"{token}.{ts}");
+        var bytes = h.ComputeHash(data);
+        return WebEncoders.Base64UrlEncode(bytes);
+    }
+
+    static bool ValidateHmac(string token, long ts, string sig, string secret, int skewSeconds)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (Math.Abs(now - ts) > Math.Abs(skewSeconds)) return false;
+
+        var expected = ComputeHmac(token, ts, secret);
+        try
+        {
+            var a = WebEncoders.Base64UrlDecode(sig);
+            var b = WebEncoders.Base64UrlDecode(expected);
+            return CryptographicOperations.FixedTimeEquals(a, b);
+        }
+        catch { return false; }
+    }
 }
 
-// ===== Models / Helpers =====
+// ===== Models / DTOs / HTML =====
 public record ShortenerOptions
 {
     public string ShortBaseUrl { get; set; } = "http://localhost:8080";
@@ -191,6 +250,13 @@ public record ShortenerOptions
     public int    CodeLength    { get; set; } = 7;
     public int    DefaultTtlHours { get; set; } = 48;
     public int    DefaultUsageMax { get; set; } = 2;
+}
+
+public record HmacOptions
+{
+    public bool   Enabled     { get; set; } = true;
+    public string Secret      { get; set; } = "change_me_dev_secret";
+    public int    SkewSeconds { get; set; } = 300;
 }
 
 public record IssueRequest
@@ -242,8 +308,20 @@ public record OtpEntry
     public int AttemptsLeft { get; set; } = 3;
 }
 
-public record OtpSendRequest { public string Token { get; init; } = default!; }
-public record OtpVerifyRequest { public string Token { get; init; } = default!; public string Code { get; init; } = default!; }
+public record OtpSendRequest
+{
+    public string Token { get; init; } = default!;
+    public long? Ts { get; init; }           // HMAC timestamp
+    public string? Sig { get; init; }        // HMAC signature
+}
+
+public record OtpVerifyRequest
+{
+    public string Token { get; init; } = default!;
+    public string Code { get; init; } = default!;
+    public long? Ts { get; init; }           // HMAC timestamp
+    public string? Sig { get; init; }        // HMAC signature
+}
 
 public static class Html
 {
