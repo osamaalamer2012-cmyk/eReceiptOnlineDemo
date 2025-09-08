@@ -1,6 +1,6 @@
-# e-Receipt Online Demo (ASP.NET Core 8 Minimal API)
+# e-Receipt Online Demo (ASP.NET Core 8 Minimal API) — Fixed (no top-level statements)
 
-This demo shows the full journey online: agent issues receipt → short URL → customer OTP → receipt view. SMS/OTP are simulated.
+This version avoids C# CS8803 by using a classic Program.Main entry point and a Templates helper class.
 
 ## Local run
 ```bash
@@ -10,12 +10,13 @@ dotnet run --urls=http://0.0.0.0:8080
 
 ## Docker
 ```bash
-docker build -t ereceipt-demo .
-docker run -p 8080:8080 ereceipt-demo
+docker build -t ereceipt-demo-fixed .
+docker run -p 8080:8080 ereceipt-demo-fixed
 ```
 
-## Free deploy (Render)
-- Create a new **Web Service** from this folder (Dockerfile is included).
-- After deploy, open the public URL.
-- Use the Agent page to issue a receipt, then click the short link in **SMS Preview**.
-- On the customer page, click **Send OTP** (demo shows the OTP). Enter it to view the receipt.
+## Render deploy
+- Create a Web Service from this folder (Dockerfile included).
+- Set env vars:
+  - Shortener__ShortBaseUrl = https://<your-render-app>.onrender.com
+  - Shortener__ViewBaseUrl  = https://<your-render-app>.onrender.com/view
+- Open the URL, issue a receipt, click the short link, send OTP (demo shows code), verify, view receipt.
