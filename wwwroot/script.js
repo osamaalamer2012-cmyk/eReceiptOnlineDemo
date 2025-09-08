@@ -10,11 +10,20 @@ if (el('btnIssue')){
       currency: el('currency').value,
       items: [{ sku:'SKU1', name:'Sample Product', qty:1, price: parseFloat(el('amount').value)}]
     };
-    const res = await fetch('/tcrm/issue', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    const res = await fetch('/tcrm/issue', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
     const json = await res.json();
     if(res.ok){
-      el('issueResult').innerHTML = '✅ Issued — receiptId: <b>'+json.receiptId+'</b>';
-      el('smsPreview').innerHTML = 'SMS: <a href="'+json.shortUrl+'" target="_blank">'+json.shortUrl+'</a>';
+      // Show token + HMAC params so you can see them
+      el('issueResult').innerHTML =
+        '✅ Issued — receiptId: <b>'+json.receiptId+
+        '</b><br/><small>token: <code>'+json.token+
+        '</code> | ts: <code>'+json.ts+
+        '</code> | sig: <code>'+json.sig+'</code></small>';
+      el('smsPreview').innerHTML =
+        'SMS: <a href="'+json.shortUrl+'" target="_blank">'+json.shortUrl+'</a>';
     }else{
       el('issueResult').innerText = '❌ '+(json.error || 'Failed');
     }
@@ -25,14 +34,27 @@ if (el('btnIssue')){
 if (location.pathname.endsWith('/view.html')){
   const params = new URLSearchParams(location.search);
   const token = params.get('token');
+  const ts    = params.get('ts');   // HMAC ts (string)
+  const sig   = params.get('sig');  // HMAC sig
+
   document.getElementById('sendOtp').onclick = async ()=>{
-    const res = await fetch('/api/otp/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token }) });
+    const res = await fetch('/api/otp/send', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ token, ts: ts ? Number(ts) : null, sig })
+    });
     const json = await res.json();
-    document.getElementById('otpDemo').innerHTML = json.otpDemo ? '<small>DEMO OTP: <b>'+json.otpDemo+'</b></small>' : '';
+    document.getElementById('otpDemo').innerHTML =
+      json.otpDemo ? '<small>DEMO OTP: <b>'+json.otpDemo+'</b></small>' : '';
   };
+
   document.getElementById('verifyOtp').onclick = async ()=>{
     const code = document.getElementById('otpCode').value;
-    const res = await fetch('/api/otp/verify', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token, code }) });
+    const res = await fetch('/api/otp/verify', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ token, code, ts: ts ? Number(ts) : null, sig })
+    });
     const json = await res.json();
     const status = document.getElementById('status');
     if(res.ok){
