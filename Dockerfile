@@ -12,4 +12,3 @@ COPY --from=build /out .
 # DO NOT set ASPNETCORE_URLS to 8080 here; the app binds to Render's PORT dynamically.
 EXPOSE 8080
 ENTRYPOINT ["dotnet", "eReceiptOnlineDemo.dll"]
-
