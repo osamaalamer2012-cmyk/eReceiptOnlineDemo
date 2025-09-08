@@ -1,7 +1,7 @@
-
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using Microsoft.AspNetCore.WebUtilities;
+using System.IO;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -10,15 +10,33 @@ var opts = builder.Configuration.GetSection("Shortener").Get<ShortenerOptions>()
 
 var app = builder.Build();
 
-// static files
+// Serve static files from wwwroot
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-// in-memory stores
-var receipts = new ConcurrentDictionary<string, Receipt>();
-var tokenToReceipt = new ConcurrentDictionary<string, string>();
-var codes = new ConcurrentDictionary<string, ShortMap>();
-var otpStore = new ConcurrentDictionary<string, OtpEntry>();
+// ✅ Serve the Agent page at "/" (and handle HEAD)
+app.MapMethods("/", new[] { "GET", "HEAD" }, (IWebHostEnvironment env) =>
+{
+    var indexPath = Path.Combine(env.WebRootPath ?? "", "index.html");
+    if (File.Exists(indexPath)) return Results.File(indexPath, "text/html");
+    // Fallback inline page if wwwroot/index.html is missing
+    return Results.Content("""
+<!doctype html><html><head><meta charset="utf-8"><title>e-Receipt</title>
+<link rel="stylesheet" href="/style.css"></head><body>
+<header><h1>e-Receipt Demo</h1></header>
+<main class="card"><p>Index file not found. Ensure <code>wwwroot/index.html</code> is in your repo.</p>
+<p>Health: <a href="/health">/health</a></p></main></body></html>
+""", "text/html");
+});
+
+// ✅ Any unmatched path → index.html (SPA-style)
+app.MapFallback((IWebHostEnvironment env) =>
+{
+    var indexPath = Path.Combine(env.WebRootPath ?? "", "index.html");
+    return File.Exists(indexPath)
+        ? Results.File(indexPath, "text/html")
+        : Results.NotFound();
+});
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
@@ -73,6 +91,7 @@ app.MapPost("/tcrm/issue", (IssueRequest req) =>
     });
 });
 
+// Short link redirect
 app.MapGet("/s/{code}", (string code) =>
 {
     if (!codes.TryGetValue(code, out var map))
@@ -84,6 +103,7 @@ app.MapGet("/s/{code}", (string code) =>
     return Results.Redirect(map.LongUrl, false);
 });
 
+// OTP APIs (demo)
 app.MapPost("/api/otp/send", (OtpSendRequest req) =>
 {
     if (req == null || string.IsNullOrWhiteSpace(req.Token))
@@ -127,13 +147,22 @@ app.MapPost("/api/otp/verify", (OtpVerifyRequest req) =>
     return Results.Ok(new { receiptId = rec.ReceiptId });
 });
 
+// Receipt JSON
 app.MapGet("/api/receipt/{id}", (string id) =>
 {
     if (!receipts.TryGetValue(id, out var rec)) return Results.NotFound(new { error = "Not found" });
     return Results.Ok(rec);
 });
 
-app.Run("http://0.0.0.0:8080");
+// ✅ Bind to Render’s dynamic port
+var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+app.Run($"http://0.0.0.0:{port}");
+
+// ===== in-memory stores =====
+static ConcurrentDictionary<string, Receipt> receipts = new();
+static ConcurrentDictionary<string, string> tokenToReceipt = new();
+static ConcurrentDictionary<string, ShortMap> codes = new();
+static ConcurrentDictionary<string, OtpEntry> otpStore = new();
 
 // ===== helpers / models =====
 static string GenerateCode(int length)
@@ -197,3 +226,4 @@ $@"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' conten
 <link rel='stylesheet' href='/style.css'></head><body><header><h1>e-Receipt</h1></header><main><section class='card'>
 <h2>Cannot open receipt</h2><p>{System.Net.WebUtility.HtmlEncode(message)}</p><p><a href='/'>Back</a></p></section></main></body></html>";
 }
+
