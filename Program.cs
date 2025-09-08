@@ -14,12 +14,12 @@ var app = builder.Build();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-// ✅ Serve the Agent page at "/" (and handle HEAD)
+// ✅ Serve the Agent page at "/" (GET/HEAD)
 app.MapMethods("/", new[] { "GET", "HEAD" }, (IWebHostEnvironment env) =>
 {
     var indexPath = Path.Combine(env.WebRootPath ?? "", "index.html");
     if (File.Exists(indexPath)) return Results.File(indexPath, "text/html");
-    // Fallback inline page if wwwroot/index.html is missing
+    // fallback inline page if wwwroot/index.html is missing
     return Results.Content("""
 <!doctype html><html><head><meta charset="utf-8"><title>e-Receipt</title>
 <link rel="stylesheet" href="/style.css"></head><body>
@@ -40,6 +40,13 @@ app.MapFallback((IWebHostEnvironment env) =>
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
+// ---- In-memory stores (valid in top-level program) ----
+var receipts = new ConcurrentDictionary<string, Receipt>();
+var tokenToReceipt = new ConcurrentDictionary<string, string>();
+var codes = new ConcurrentDictionary<string, ShortMap>();
+var otpStore = new ConcurrentDictionary<string, OtpEntry>();
+
+// ---- Issue (Agent sim) ----
 app.MapPost("/tcrm/issue", (IssueRequest req) =>
 {
     if (req is null || string.IsNullOrWhiteSpace(req.TxnId) || string.IsNullOrWhiteSpace(req.Msisdn))
@@ -91,7 +98,7 @@ app.MapPost("/tcrm/issue", (IssueRequest req) =>
     });
 });
 
-// Short link redirect
+// ---- Short link redirect ----
 app.MapGet("/s/{code}", (string code) =>
 {
     if (!codes.TryGetValue(code, out var map))
@@ -103,7 +110,7 @@ app.MapGet("/s/{code}", (string code) =>
     return Results.Redirect(map.LongUrl, false);
 });
 
-// OTP APIs (demo)
+// ---- OTP APIs (demo) ----
 app.MapPost("/api/otp/send", (OtpSendRequest req) =>
 {
     if (req == null || string.IsNullOrWhiteSpace(req.Token))
@@ -147,7 +154,7 @@ app.MapPost("/api/otp/verify", (OtpVerifyRequest req) =>
     return Results.Ok(new { receiptId = rec.ReceiptId });
 });
 
-// Receipt JSON
+// ---- Receipt JSON ----
 app.MapGet("/api/receipt/{id}", (string id) =>
 {
     if (!receipts.TryGetValue(id, out var rec)) return Results.NotFound(new { error = "Not found" });
@@ -158,22 +165,7 @@ app.MapGet("/api/receipt/{id}", (string id) =>
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Run($"http://0.0.0.0:{port}");
 
-// ===== in-memory stores =====
-static ConcurrentDictionary<string, Receipt> receipts = new();
-static ConcurrentDictionary<string, string> tokenToReceipt = new();
-static ConcurrentDictionary<string, ShortMap> codes = new();
-static ConcurrentDictionary<string, OtpEntry> otpStore = new();
-
-// ===== helpers / models =====
-static string GenerateCode(int length)
-{
-    const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    var bytes = RandomNumberGenerator.GetBytes(length);
-    Span<char> chars = stackalloc char[length];
-    for (int i = 0; i < length; i++) chars[i] = alphabet[bytes[i] % alphabet.Length];
-    return new string(chars);
-}
-
+// ===== models & helpers =====
 record ShortenerOptions
 {
     public string ShortBaseUrl { get; set; } = "http://localhost:8080";
@@ -227,3 +219,12 @@ $@"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' conten
 <h2>Cannot open receipt</h2><p>{System.Net.WebUtility.HtmlEncode(message)}</p><p><a href='/'>Back</a></p></section></main></body></html>";
 }
 
+// helper
+static string GenerateCode(int length)
+{
+    const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    var bytes = RandomNumberGenerator.GetBytes(length);
+    Span<char> chars = stackalloc char[length];
+    for (int i = 0; i < length; i++) chars[i] = alphabet[bytes[i] % alphabet.Length];
+    return new string(chars);
+}
