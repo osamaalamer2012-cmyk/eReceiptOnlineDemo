@@ -14,7 +14,7 @@ if (el('btnIssue')){
     const json = await res.json();
     if(res.ok){
       el('issueResult').innerHTML = '✅ Issued — receiptId: <b>'+json.receiptId+'</b>';
-      el('smsPreview').innerHTML = 'SMS to customer: <a href="'+json.shortUrl+'" target="_blank">'+json.shortUrl+'</a>';
+      el('smsPreview').innerHTML = 'SMS: <a href="'+json.shortUrl+'" target="_blank">'+json.shortUrl+'</a>';
     }else{
       el('issueResult').innerText = '❌ '+(json.error || 'Failed');
     }
